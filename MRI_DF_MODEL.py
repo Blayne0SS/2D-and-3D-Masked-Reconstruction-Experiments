@@ -54,9 +54,6 @@ if __name__ == "__main__":
         spatial_dims=3,
         data_range=1.0
     ).to(device)
-    ##INSERT COMMENTS TO JUSTIFY SECTIONS NOTE 
-    
-    
     
     #MRI BLOCK varible
     # A MRI block is a section which the model will be trained on.
@@ -67,14 +64,10 @@ if __name__ == "__main__":
                     48)  #Wideth :  X  
 
 
-
     MRI_MASK_MIN = (11, 11, 11)
     MRI_MASK_MAX = (25, 25, 25)
     
-    
-    
-    base_channel_number=28      # 
-    
+    base_channel_number=28     
     
     
     number_of_epochs      = 11 #number of epochs  
@@ -83,16 +76,10 @@ if __name__ == "__main__":
     
     lr_option         = 4e-5      #learning rate 
 
-
-
-
-
     CPU_num_workers = 6 #1          #CPU CORES used 
     GPU_batch_size=4 #35            #Images stored on gpu
 
     
-
-
     T = 100                     #Steps
     DDIM_STEPS = 50
     ETA = 0.0
