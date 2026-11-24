@@ -11,7 +11,7 @@ The scripts are separate experiments. They do not all need to be run in a set or
 | `MRI_ANTS.py` | Aligns 3D MRI scans to a reference MRI template using ANTsPy. |
 | `MB_Diffusion_test_extended_GREY_sig_V2.py` | Trains a 2D masked diffusion model on grayscale 2D slices from an MRI dataset. |
 | `MRI_DF_MODEL.py` | Trains and tests a 3D masked diffusion model on MRI volumes. |
-| `mri_masked_autoencoder.py` | Trains a 3D masked autoencoder on MRI volumes. It also supports testing and inference on one scan. |
+| `mri_masked_autoencoder.py` | Allows for testing/reconstruction and inference on one scan. |
 
 ## How the reconstruction task works
 
