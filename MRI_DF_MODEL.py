@@ -1,9 +1,12 @@
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import random
 import time
 from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -35,6 +38,8 @@ import sys
 import nibabel as nib
 from tqdm import tqdm
 import ants
+import faulthandler
+
 
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from monai.losses import SSIMLoss
@@ -45,39 +50,42 @@ from monai.losses import SSIMLoss
 # =============================================
 if __name__ == "__main__":  
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    USE_BF16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    faulthandler.enable()
     print("Device:", device, torch.cuda.get_device_name(0) if device.type == "cuda" else "")
     if device.type == "cpu":
         sys.exit("GPU not available")
     torch.cuda.empty_cache()
+    
     ssim_3d = SSIMLoss(
         spatial_dims=3,
-        data_range=1.0
+        data_range=1.0,
+        win_size=5
     ).to(device)
-    
+        
     #MRI BLOCK varible
     # A MRI block is a section which the model will be trained on.
     # It represents a 3D object in which the mask will be located/placed in
 
-    MRI_BLOCK_SHAPE = (48,  #Depth  :  Z
-                    48,  #Hight  :  Y
-                    48)  #Wideth :  X  
+    MRI_BLOCK_SHAPE = (32,  #Depth  :  Z
+                    32,  #Hight  :  Y
+                    32)  #Wideth :  X  
 
 
-    MRI_MASK_MIN = (11, 11, 11)
-    MRI_MASK_MAX = (25, 25, 25)
-    
+    MRI_MASK_MIN = (7,7,7)
+    MRI_MASK_MAX = (15,15,15)
+
     base_channel_number=28     
     
     
-    number_of_epochs      = 11 #number of epochs  
+    number_of_epochs      = 51 #number of epochs  
 
 
     
     lr_option         = 4e-5      #learning rate 
 
-    CPU_num_workers = 6 #1          #CPU CORES used 
-    GPU_batch_size=4 #35            #Images stored on gpu
+    CPU_num_workers = 2 #1          #CPU CORES used 
+    GPU_batch_size=16 #35            #Images stored on gpu
 
     
     T = 100                     #Steps
@@ -88,20 +96,22 @@ if __name__ == "__main__":
     #create a^2(t) vs t graph 
     #to show  effectivness
     #See fig 2 https://arxiv.org/pdf/2405.14802
-    #Base off this, we should switch to a FAST DDPM(also know as DDIM) 
+    #Base off this should switch to a FAST DDPM(also know as DDIM) 
 
 
-    Training_data_folder="/mnt/hpccs01/home/n10514821/X_ray_models/Data/MRI_T1_New_dataset"
-    #Training_data_folder = "/home/blayne/REFORMED_MRI_3D_DATASET/"
-    
-    #ALIGNED_DIR = "/home/blayne/aligned_mri_cache_block"
-    
-    #TEMPLATE_PATH = "/home/blayne/REFORMED_MRI_3D_DATASET/sub-000103/sub-000103_acq-standard_T1w.nii"
-    
-    TEMPLATE_PATH = "/mnt/hpccs01/home/n10514821/X_ray_models/Data/MRI_T1_New_dataset/IXI284-HH-2354-T1/IXI284-HH-2354-T1.nii"
-    ALIGNED_DIR = "/mnt/hpccs01/home/n10514821/X_ray_models/SYN_aligned_mri_cache_block"
+    PROJECT_DIR = Path(__file__).resolve().parent
 
-    os.makedirs(ALIGNED_DIR, exist_ok=True)
+    # Location of Neurite-OASIS dataset
+    Training_data_folder = "/home/blayne/Desktop/MRI/Neurite-OASIS"
+
+    TEMPLATE_PATH = None
+
+    ALIGNED_DIR = str(PROJECT_DIR / "aligned_mri_cache")
+
+    if not os.path.isdir(Training_data_folder):
+        raise FileNotFoundError(
+            f"MRI dataset folder not found: {Training_data_folder}"
+        )
 
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -126,31 +136,36 @@ if __name__ == "__main__":
             # -----------------------------------
             # 2. Load images into memory (numpy)
             # -----------------------------------
-            #Due to the use of GroupShuffleSplit, images have to shifted to the 
-            #numpy array 
             X = []
             y = []
             groups = []  
             for root, _, files in os.walk(chexpert_train_folder):
                 for file_name in files:
-                    if file_name.lower().endswith((".nii")):
-                        img_path = os.path.join(root, file_name)
-                        X.append(img_path)
-                        y.append(0)
-                        groups.append(root)  
+                    if file_name != "aligned_norm.nii.gz":
+                        continue
+
+                    img_path = os.path.join(root, file_name)
+                    X.append(img_path)
+                    y.append(0)
+                    groups.append(root)
 
 
             if len(X) == 0:
                 raise RuntimeError(
                     f"No images were loaded from {chexpert_train_folder}"
                 )
-            print(len(X))
-            
+            if len(set(groups)) < 4:
+                raise ValueError(
+                    "At least 4 distinct subject folders are required."
+                )
+            print(f"Total MRI volumes found: {len(X)}")
+            print(f"Unique subjects: {len(set(groups))}")
+            print(f"Example MRI: {X[0]}")
+            X = np.array(X)
             y = np.array(y)
             groups = np.array(groups)
 
-
-            # -----------------------------------
+                    # -----------------------------------
             # 4. Shuffle
             # -----------------------------------
             X, y, groups = shuffle(X, y, groups, random_state=seed)
@@ -177,6 +192,12 @@ if __name__ == "__main__":
             y_val, y_test = y_rest[val_idx], y_rest[test_idx]
 
 
+            print("\n========== MRI DATASET ==========")
+            print(f"Training:   {len(X_train)} volumes")
+            print(f"Validation: {len(X_val)} volumes")
+            print(f"Testing:    {len(X_test)} volumes")
+            print("=================================\n")
+
             return{
                     "Train":{ 'train':(X_train, y_train)},
                     "Val": {'val':(X_val, y_val)},
@@ -193,6 +214,8 @@ if __name__ == "__main__":
         """
         if os.path.exists(output_path):
             return output_path
+        if ants is None:
+            raise ImportError("Install antspyx to run ANTs registration, or use aligned volumes.")
 
         try:
             fixed = ants.image_read(template_path)
@@ -220,7 +243,7 @@ if __name__ == "__main__":
 
     class MRI_Dataset(Dataset):
         def __init__(self, paths, y, template_path, aligned_dir,
-                     transform=None, return_index=False):
+                        transform=None, return_index=False):
             self.paths = paths
             self.y = y
             self.transform = transform
@@ -236,16 +259,10 @@ if __name__ == "__main__":
             path = self.paths[idx]
             label = self.y[idx]
 
-            # -----------------------------
-            # 🔥 ALIGNMENT (cached)
-            # -----------------------------
-            filename = os.path.basename(path)
-            aligned_path = os.path.join(self.aligned_dir, filename)
-
-            # -----------------------------
-            # Load aligned MRI
-            # -----------------------------
-            nii = nib.load(aligned_path)
+            # ------------------------------
+            # Load data
+            #-----------------------------
+            nii = nib.load(path)
             data = nii.get_fdata(dtype=np.float32)
 
             # -----------------------------
@@ -257,7 +274,10 @@ if __name__ == "__main__":
             # Tensor + reorder
             # -----------------------------
             image = torch.from_numpy(data)
-            image = image.permute(2, 0, 1)  # [D,H,W]
+            # NIfTI array is [X,Y,Z]; model uses [D,H,W] = [Z,Y,X].
+            # NOTE: This corrects the previous [Z,X,Y] ordering and changes
+            # axis conventions relative to any old checkpoints.
+            image = image.permute(2, 1, 0).contiguous()
 
             if self.transform is not None:
                 image = self.transform(image)
@@ -333,7 +353,7 @@ if __name__ == "__main__":
             shuffle=True,
             drop_last=True,
             num_workers=CPU_num_workers,
-            pin_memory=True,
+            pin_memory=False,
             persistent_workers=True,
             prefetch_factor=2
         )
@@ -344,7 +364,7 @@ if __name__ == "__main__":
         shuffle=False,
         #drop_last=True,
         num_workers=CPU_num_workers,
-        pin_memory=True,
+        pin_memory=False,
         persistent_workers=True,
         prefetch_factor=2
     )
@@ -355,7 +375,7 @@ if __name__ == "__main__":
         shuffle=False,
         #drop_last=True,
         num_workers=CPU_num_workers,
-        pin_memory=True,
+        pin_memory=False,
         persistent_workers=True,
         prefetch_factor=2
     )
@@ -414,6 +434,10 @@ if __name__ == "__main__":
 
         bd, bh, bw = MRI_BLOCK_SHAPE
         MD, MH, MW = MRI_MASK_SHAPE
+        if any(s > v for s, v in zip((bd, bh, bw), (D, H, W))):
+            raise ValueError(f"MRI block {MRI_BLOCK_SHAPE} exceeds volume {(D, H, W)}")
+        if any(m > b for m, b in zip((MD, MH, MW), (bd, bh, bw))):
+            raise ValueError(f"Mask {MRI_MASK_SHAPE} exceeds block {MRI_BLOCK_SHAPE}")
 
         blocks = []
         masks = []
@@ -465,9 +489,9 @@ if __name__ == "__main__":
             cz, cy, cx = idx.tolist()
 
             # clamp
-            cz = max(bd//2, min(cz, D - bd//2 - 1))
-            cy = max(bh//2, min(cy, H - bh//2 - 1))
-            cx = max(bw//2, min(cx, W - bw//2 - 1))
+            cz = max(bd//2, min(cz, D - (bd - bd//2)))
+            cy = max(bh//2, min(cy, H - (bh - bh//2)))
+            cx = max(bw//2, min(cx, W - (bw - bw//2)))
 
             block = volume[
                 cz-bd//2:cz+bd//2,
@@ -509,9 +533,9 @@ if __name__ == "__main__":
 
             cmz, cmy, cmx = idxm.tolist()
 
-            cmz = max(MD//2, min(cmz, bd - MD//2 - 1))
-            cmy = max(MH//2, min(cmy, bh - MH//2 - 1))
-            cmx = max(MW//2, min(cmx, bw - MW//2 - 1))
+            cmz = max(MD//2, min(cmz, bd - (MD - MD//2)))
+            cmy = max(MH//2, min(cmy, bh - (MH - MH//2)))
+            cmx = max(MW//2, min(cmx, bw - (MW - MW//2)))
 
             mask = torch.ones_like(block)
 
@@ -519,7 +543,7 @@ if __name__ == "__main__":
             y1 = cmy - MH//2
             x1 = cmx - MW//2
 
-          
+            
             mask = torch.ones_like(block)
 
             mask[
@@ -543,8 +567,6 @@ if __name__ == "__main__":
         blocks = torch.stack(blocks).unsqueeze(1)
         masks = torch.stack(masks).unsqueeze(1)
         masked_blocks = torch.stack(masked_blocks).unsqueeze(1)
-        if mask.dim() == 4:
-            mask = mask.unsqueeze(1)
         return (
             blocks,
             block_locations,
@@ -634,7 +656,8 @@ if __name__ == "__main__":
     
     # Add noise to the selected block while keeping the observed region available.
 
-    def forward_diffusion_sample_section_with_mask(block, mask,block_location,mask_location, t, device="cuda"):
+    def forward_diffusion_sample_section_with_mask(block, mask,block_location,mask_location, t, device=None):
+        device = block.device if device is None else device
         block = block.to(device)
         known_mask= mask.to(device)
         """block,block_location,masked_block,mask_location,mask =Masking_function(MRI_Model,
@@ -702,7 +725,7 @@ if __name__ == "__main__":
         """
         Shows a single slice from a 3D or 4D tensor
         """
-       # Collapse to [D,H,W]
+        # Collapse to [D,H,W]
         if volume.dim() == 5:       # [B,C,D,H,W]
             volume = volume[0, 0]
         elif volume.dim() == 4:     # [B,D,H,W] or [C,D,H,W]
@@ -1096,7 +1119,7 @@ if __name__ == "__main__":
             # Apply dense skip connections to encoder features
             skip1 = self.skip1(x2)
             skip2 = self.skip2(x3)
-       
+        
 
             # Decoder
 
@@ -1107,13 +1130,13 @@ if __name__ == "__main__":
             x = torch.cat([x, skip2], dim=1)
             x = self.up1(x, t_emb)
             x = self.up1_attn(x)
-          
+            
 
             x = self.up_sample2(x)
             x = crop_to_match(x, skip1)  # Crop to match skip1 (x2)
             x = torch.cat([x, skip1], dim=1)
             x = self.up2(x, t_emb)
-           
+            
             
             x = self.up_sample3(x)
             x = crop_to_match(x, x1)     # Crop to match x1
@@ -1132,10 +1155,9 @@ if __name__ == "__main__":
         memory_format=torch.channels_last_3d
     )
 
-    model = torch.compile(
-        raw_model,
-        mode="reduce-overhead"
-    )
+    # Keep compilation OFF while first testing the full model on ROCm.
+    # It can increase setup time and memory, and complicate debugging.
+    model = raw_model
 
     print(
         "Num params:",
@@ -1161,7 +1183,7 @@ if __name__ == "__main__":
         
         
         
-      
+        
     def masked_ssim_loss_3d(pred, target, mask):
         """
         SSIM loss calculated separately over each sample's
@@ -1213,20 +1235,20 @@ if __name__ == "__main__":
     # Calculate the training loss for the predicted diffusion output.
 
     def get_loss(model,MRI_Model, block,mask,block_location,mask_location,MRI_BLOCK_SHAPE,current_mask_shape, t):
+        # MRI_Model is the full volume, intentionally kept on CPU to save VRAM.
+        # block and mask are small 3D patches transferred to the GPU.
         block = block.to(device)
         mask = mask.to(device)
         t = t.to(device)
-        
 
-        x_noisy, mask, noise,block_location,mask_location=forward_diffusion_sample_section_with_mask(
-            block,mask,block_location,mask_location, t
-        )
+        x_noisy, mask, noise, block_location, mask_location = \
+            forward_diffusion_sample_section_with_mask(
+                block, mask, block_location, mask_location, t
+            )
         if (1 - mask).sum() == 0:
             return None, None, None, None
-            
-            
-        D, H, W = MRI_Model.shape[-3:]
 
+        D, H, W = MRI_Model.shape[-3:]
         coords, mask_info = build_spatial_conditioning(
             block_location=block_location,
             mask_location=mask_location,
@@ -1235,19 +1257,35 @@ if __name__ == "__main__":
             full_shape=(D, H, W),
             device=device
         )
-    
-   
-    
-        # ------------------------------------------------------------
-        # Masked region
-        # mask = 1 -> known
-        # mask = 0 -> reconstructed
-        # ------------------------------------------------------------
+
+        # Original diffusion coefficients sampled at this batch's timesteps.
+        alphas_cumprod_t = get_index_from_list(alphas_cumprod, t, block.shape)
+        sqrt_alpha_t = torch.sqrt(alphas_cumprod_t)
+        sqrt_one_minus_alpha_t = torch.sqrt((1.0 - alphas_cumprod_t).clamp_min(0))
 
         if mask.dim() == 4:
             mask_5d = mask.unsqueeze(1)
         else:
             mask_5d = mask
+
+        # v-prediction target: v = sqrt(alpha_bar) * eps - sqrt(1-alpha_bar) * x0
+        v_target = sqrt_alpha_t * noise - sqrt_one_minus_alpha_t * block
+
+        # The model sees the noisy block and receives the uncorrupted context.
+        context = block * mask_5d
+        v_pred = model(
+            x_noisy, t, coords=coords, mask=mask_5d,
+            mask_info=mask_info, context=context
+        )
+
+        # Recover x0 from predicted velocity, consistent with sample_timestep().
+        x0_pred = sqrt_alpha_t * x_noisy - sqrt_one_minus_alpha_t * v_pred
+
+        # ------------------------------------------------------------
+        # Masked region
+        # mask = 1 -> known
+        # mask = 0 -> reconstructed
+        # ------------------------------------------------------------
 
         masked_region = 1.0 - mask_5d
 
@@ -1331,7 +1369,8 @@ if __name__ == "__main__":
                 snr,
                 torch.full_like(snr, gamma)
             )
-            / (snr + 1e-8)
+            # Min-SNR weighting for v-prediction uses (SNR + 1), not SNR.
+            / (snr + 1.0)
         )
 
 
@@ -1619,8 +1658,6 @@ if __name__ == "__main__":
         # -----------------------------
         # Reverse diffusion schedule
         # -----------------------------
-        ddim_steps = DDIM_STEPS
-
         ddim_steps = min(ddim_steps, T_local)
 
         step_indices = torch.linspace(
@@ -1634,7 +1671,7 @@ if __name__ == "__main__":
             step_indices
         )
 
-      
+        
         
         # -----------------------------
         # Proper timestep selection
@@ -1750,15 +1787,20 @@ if __name__ == "__main__":
 
         @torch.no_grad()
         def update(self, model):
-            model_state = model.state_dict()
-            ema_state = self.ema_model.state_dict()
-
-            for name in ema_state.keys():
-                ema_state[name].mul_(self.decay).add_(
-                    model_state[name], alpha=1 - self.decay
+            for ema_param, param in zip(
+                self.ema_model.parameters(),
+                model.parameters()
+            ):
+                ema_param.lerp_(
+                    param,
+                    1.0 - self.decay
                 )
 
-            self.ema_model.load_state_dict(ema_state)
+            for ema_buffer, buffer in zip(
+                self.ema_model.buffers(),
+                model.buffers()
+            ):
+                ema_buffer.copy_(buffer)
             
     # Measure PSNR over the region that was hidden from the model.
 
@@ -1848,16 +1890,18 @@ if __name__ == "__main__":
             :, :, z_min:z_max, y_min:y_max, x_min:x_max
         ]
 
+        if min(original_crop.shape[-3:]) < 5:
+            raise ValueError(
+                f"Masked region too small for 3D SSIM: "
+                f"{original_crop.shape[-3:]}"
+            )
+
         loss = ssim_3d(
             reconstructed_crop,
             original_crop
         )
 
-        ssim_value = torch.clamp(
-            1.0 - loss,
-            0.0,
-            1.0
-        )
+        ssim_value = 1.0 - loss
 
         return ssim_value.item()
         
@@ -1884,9 +1928,7 @@ if __name__ == "__main__":
     val_ssim_list = []
     
     
-    ssim_metric = StructuralSimilarityIndexMeasure(data_range=2.0).to(device)
-    
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
     
     for epoch in range(number_of_epochs):
         # ---- TRAIN ----
@@ -1896,20 +1938,25 @@ if __name__ == "__main__":
         train_ssim_epoch = 0
         train_metric_count = 0
         val_metric_count = 0
-        
+        train_loss_sum = torch.zeros((), device=device)
+        train_batches_processed = 0
+        TRAIN_METRIC_EVERY = 10
+
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=True)
         
         
         for batch_idx, batch in enumerate(pbar):
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
+            if epoch == 0 and batch_idx == 0:
+                torch.cuda.reset_peak_memory_stats()
 
-            MRI_model = batch[0].to(device, non_blocking=True)  # (B,1,D,H,W)
+            MRI_model = batch[0]
 
             B = MRI_model.shape[0]
 
             t = torch.randint(0, T, (B,), device=device)
             
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_BF16):
                 current_mask_shape = random_mask_shape(
                     MRI_MASK_MIN,
                     MRI_MASK_MAX
@@ -1921,9 +1968,24 @@ if __name__ == "__main__":
                         current_mask_shape,
                         MRI_BLOCK_SHAPE
                     )
-                    
+
+                
+                block = block.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+                if batch_idx % TRAIN_METRIC_EVERY == 0:
+
+                    print("Full MRI device:", MRI_model.device)
+                    print("Training block device:", block.device)
+                    print("Mask device:", mask.device)
+
+                    print(
+                        "VRAM allocated:",
+                        round(torch.cuda.memory_allocated() / 1024**3, 2),
+                        "GiB"
+                    )
+
                 loss, x_noisy, v_pred, noise  = get_loss(model, MRI_model,block,mask,block_location,mask_block_location,MRI_BLOCK_SHAPE,current_mask_shape,t)
-           
+            
                 if loss is None:
                     continue
             scaler.scale(loss).backward()
@@ -1935,118 +1997,11 @@ if __name__ == "__main__":
 
             ema.update(raw_model)
             
-            if batch_idx == 0 and epoch % 5 == 0 and epoch != 0:
-                    #print(f"Epoch {epoch} | Loss: {loss.item()} ")
-                    sample_plot_image(
-                        model=ema.ema_model,
-                        device=device,
-                        MRI_model=MRI_model,
-                        block = block,
-                        mask =mask,
-                        block_location =block_location,
-                        mask_location = mask_block_location,
-                        current_mask_shape=current_mask_shape,
-                        num_images=8,
-                        ddim_steps=DDIM_STEPS,
-                        save_path=f"V2_GREY_Linear_V1_epoch_{epoch}.png"
-                        )
-                    
-                    
-                    with torch.no_grad():
-
-                        sqrt_alphas_cumprod_t = get_index_from_list(
-                            sqrt_alphas_cumprod, t, x_noisy.shape
-                        )
-
-                        sqrt_one_minus_alphas_cumprod_t = get_index_from_list(
-                            sqrt_one_minus_alphas_cumprod, t, x_noisy.shape
-                        )
-
-                        x0_pred = (
-                            sqrt_alphas_cumprod_t * x_noisy
-                            - sqrt_one_minus_alphas_cumprod_t * v_pred
-                        )
-
-                        x0_pred = torch.clamp(x0_pred, -1, 1)
-
-                        psnr = compute_psnr_masked(
-                            (block),
-                            (x0_pred),
-                            (mask)
-                        )
-
-                        ssim = compute_ssim_masked(
-                            (block),
-                            (x0_pred),
-                            (mask)
-                        )
-                    train_psnr_epoch += psnr
-                    train_ssim_epoch += ssim
-                    train_metric_count += 1
-        
-            train_loss_epoch += loss.item()
-        
-        
-        if train_metric_count > 0:
-            train_psnr_epoch /= train_metric_count
-            train_ssim_epoch /= train_metric_count
-            train_psnr_list.append(train_psnr_epoch)
-            train_ssim_list.append(train_ssim_epoch)
-
-
-        train_loss_epoch /= len(train_loader)
-        train_losses.append(train_loss_epoch)
-        pbar.set_postfix({
-            "loss": f"{train_loss_epoch:.4f}",
-            "lr": f"{optimizer.param_groups[0]['lr']:.2e}"
-        })
-        if random.random() < 0.01:
-            print(
-                "SNR:",
-                snr.min().item(),
-                snr.max().item(),
-                "| weight:",
-                t_weight.min().item(),
-                t_weight.max().item()
-            )
-
-        # ---- VALIDATION ----
-        ema.ema_model.eval()
-        val_loss_epoch = 0
-        val_psnr_epoch = 0
-        val_ssim_epoch = 0
-        
-       
-        with torch.no_grad():
-            val_pbar = tqdm(val_loader, desc="Validation", leave=False)
-            for val_idx, batch in enumerate(val_pbar):
-
-                MRI_model = batch[0].to(device, non_blocking=True)  # (B,1,D,H,W)
-
-                B = MRI_model.shape[0]
-                t = torch.randint(0, T, (B,), device=device)
-            
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-
-                    current_mask_shape = random_mask_shape(
-                        MRI_MASK_MIN,
-                        MRI_MASK_MAX
-                    )
-
-                    block, block_location, masked_block, mask_block_location, mask = \
-                        Masking_function(
-                            MRI_model,
-                            current_mask_shape,
-                            MRI_BLOCK_SHAPE
-                        )
-                    loss, x_noisy, v_pred, noise  = get_loss(ema.ema_model, MRI_model,block,mask,block_location,mask_block_location,MRI_BLOCK_SHAPE,current_mask_shape,t)
-                
-                
-                if epoch % 5 == 0 and epoch !=0:
-                     
+            if batch_idx % TRAIN_METRIC_EVERY == 0:
+                with torch.no_grad():
                     sqrt_alphas_cumprod_t = get_index_from_list(
-                            sqrt_alphas_cumprod, t, x_noisy.shape
-                        )
+                        sqrt_alphas_cumprod, t, x_noisy.shape
+                    )
 
                     sqrt_one_minus_alphas_cumprod_t = get_index_from_list(
                         sqrt_one_minus_alphas_cumprod, t, x_noisy.shape
@@ -2070,12 +2025,121 @@ if __name__ == "__main__":
                         (x0_pred),
                         (mask)
                     )
+                train_psnr_epoch += psnr
+                train_ssim_epoch += ssim
+                train_metric_count += 1
 
-                    val_psnr_epoch += psnr
-                    val_ssim_epoch += ssim
-                    val_metric_count += 1
+                if False and (epoch + 1) % 5 == 0:
+                    sample_plot_image(
+                        model=ema.ema_model, device=device, MRI_model=MRI_model,
+                        block=block, mask=mask, block_location=block_location,
+                        mask_location=mask_block_location,
+                        current_mask_shape=current_mask_shape,
+                        num_images=8, ddim_steps=DDIM_STEPS,
+                        save_path=f"MRI_DDIM_epoch_{epoch+1}.png"
+                    )
+
+                if epoch == 0 and batch_idx == 0:
+                    torch.cuda.synchronize()
+
+                    print(
+                        "Peak VRAM after first training step:",
+                        f"{torch.cuda.max_memory_allocated()/1024**3:.2f} GiB"
+                    )
+            train_loss_sum += loss.detach()
+            train_batches_processed += 1
                     
-                            
+        
+        if train_metric_count > 0:
+            train_psnr_epoch /= train_metric_count
+            train_ssim_epoch /= train_metric_count
+            train_psnr_list.append(train_psnr_epoch)
+            train_ssim_list.append(train_ssim_epoch)
+
+
+        train_loss_epoch = (
+            train_loss_sum / max(train_batches_processed, 1)
+        ).item()
+        train_losses.append(train_loss_epoch)
+        pbar.set_postfix({
+            "loss": f"{train_loss_epoch:.4f}",
+            "lr": f"{optimizer.param_groups[0]['lr']:.2e}"
+        })
+        # SNR and t_weight are local variables inside get_loss(); do not
+        # reference them from the outer training loop.
+
+        # ---- VALIDATION ----
+        ema.ema_model.eval()
+        val_loss_epoch = 0
+        val_psnr_epoch = 0
+        val_ssim_epoch = 0
+        
+        
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc="Validation", leave=False)
+            for val_idx, batch in enumerate(val_pbar):
+
+                MRI_model = batch[0]
+
+                B = MRI_model.shape[0]
+                t = torch.randint(0, T, (B,), device=device)
+            
+                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_BF16):
+
+                    current_mask_shape = random_mask_shape(
+                        MRI_MASK_MIN,
+                        MRI_MASK_MAX
+                    )
+
+                    block, block_location, masked_block, mask_block_location, mask = \
+                        Masking_function(
+                            MRI_model,
+                            current_mask_shape,
+                            MRI_BLOCK_SHAPE
+                        )
+                    block = block.to(device, non_blocking=True)
+                    mask = mask.to(device, non_blocking=True)
+                    loss, x_noisy, v_pred, noise = get_loss(
+                        ema.ema_model, MRI_model, block, mask, block_location,
+                        mask_block_location, MRI_BLOCK_SHAPE, current_mask_shape, t
+                    )
+
+                if loss is None:
+                    continue
+                # One-step reconstruction metrics on all validation batches.
+                    
+                sqrt_alphas_cumprod_t = get_index_from_list(
+                        sqrt_alphas_cumprod, t, x_noisy.shape
+                    )
+
+                sqrt_one_minus_alphas_cumprod_t = get_index_from_list(
+                    sqrt_one_minus_alphas_cumprod, t, x_noisy.shape
+                )
+
+                x0_pred = (
+                    sqrt_alphas_cumprod_t * x_noisy
+                    - sqrt_one_minus_alphas_cumprod_t * v_pred
+                )
+
+                x0_pred = torch.clamp(x0_pred, -1, 1)
+
+                psnr = compute_psnr_masked(
+                    (block),
+                    (x0_pred),
+                    (mask)
+                )
+
+                ssim = compute_ssim_masked(
+                    (block),
+                    (x0_pred),
+                    (mask)
+                )
+
+                val_psnr_epoch += psnr * B
+                val_ssim_epoch += ssim * B
+                val_metric_count += B
+                
+                        
                 val_loss_epoch += loss.item()
                 val_pbar.set_postfix({
                 "val_loss": f"{loss.item():.4f}"})
@@ -2101,10 +2165,26 @@ if __name__ == "__main__":
             f"Val SSIM: {val_ssim_epoch:.4f}"
         )
 
-        # ---- Early Stopping ----
-
+        # Update learning-rate schedule (no early-stopping callback is configured).
         scheduler.step()
+        checkpoint = {
+            "epoch": epoch,
+            "model": raw_model.state_dict(),
+            "ema": ema.ema_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+            "train_psnr": train_psnr_list,
+            "val_psnr": val_psnr_list_epoch,
+            "train_ssim": train_ssim_list,
+            "val_ssim": val_ssim_list
+        }
 
+        torch.save(checkpoint, "mri_last.tmp")
+        os.replace("mri_last.tmp", "mri_last.pt")
+
+        print(f"Checkpoint saved: Epoch {epoch}")
 
     plt.figure()
     plt.plot(train_losses, label="Train Loss")
@@ -2116,7 +2196,7 @@ if __name__ == "__main__":
     plt.savefig("V2_GREY_loss_curve.png", dpi=300)
     plt.close()
     
-    print("Saved loss curve to V2_GREY_linear_V1_loss_curve.png")
+    print("Saved loss curve to V2_GREY_loss_curve.png")
     
     plt.figure()
     plt.plot(train_psnr_list, label="Train PSNR")
@@ -2269,7 +2349,6 @@ if __name__ == "__main__":
     
     
     
-    # Save a volume as a NIfTI image for later review.
 
     def save_nifti(
         volume,
@@ -2288,8 +2367,11 @@ if __name__ == "__main__":
         if convert_from_minus1_1:
             volume = (volume + 1) / 2.0
 
+        # Model tensor [D,H,W]=[Z,Y,X] --> NIfTI array [X,Y,Z].
+        
+        volume_xyz = np.transpose(volume, (2, 1, 0))
         nii = nib.Nifti1Image(
-            volume.astype(np.float32),
+            volume_xyz.astype(np.float32),
             affine=np.eye(4)
         )
 
@@ -2316,10 +2398,10 @@ if __name__ == "__main__":
     os.makedirs(save_dir, exist_ok=True)
     
     with torch.no_grad():
-
+        torch.cuda.reset_peak_memory_stats()    
         for batch in test_loader:
 
-            MRI_model = batch[0].to(device, non_blocking=True)
+            MRI_model = batch[0]  
             B = MRI_model.shape[0]
 
             # --------------------------------------------------
@@ -2336,6 +2418,8 @@ if __name__ == "__main__":
                 MRI_BLOCK_SHAPE
             )
 
+            block = block.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
             # --------------------------------------------------
             # Reconstruct masked region
             # --------------------------------------------------
@@ -2350,12 +2434,38 @@ if __name__ == "__main__":
                 device=device,
                 ddim_steps=DDIM_STEPS
             )
+            missing = mask < 0.5
 
-            # Ensure dimensions
-            block   = (block)
-            x_recon = (x_recon)
-            mask    = (mask)
+            out_of_range = (
+                ((x_recon < -1.0) | (x_recon > 1.0))
+                & missing
+            )
 
+            fraction = (
+                out_of_range.sum().float()
+                / missing.sum().clamp_min(1)
+            )
+
+            print(
+                "Out-of-range reconstructed voxels:",
+                f"{fraction.item() * 100:.2f}%"
+            )
+
+            x_recon_clipped = torch.where(
+                mask > 0.5,
+                block,
+                x_recon.clamp(-1.0, 1.0)
+            )
+
+            print(
+                "Original PSNR:",
+                compute_psnr_masked(block, x_recon, mask)
+            )
+
+            print(
+                "Clipped PSNR:",
+                compute_psnr_masked(block, x_recon_clipped, mask)
+            )
             # --------------------------------------------------
             # Measure PSNR ONLY on reconstructed region
             # --------------------------------------------------
@@ -2390,29 +2500,15 @@ if __name__ == "__main__":
                 # Save outputs
                 # --------------------------------------------------
 
-                save_nifti(
-                    block[i:i+1],
-                    "...gt.nii.gz",
-                    convert_from_minus1_1=True
-                )
-
-                save_nifti(
-                    x_recon[i:i+1],
-                    "...recon.nii.gz",
-                    convert_from_minus1_1=True
-                )
-
-                save_nifti(
-                    mask[i:i+1],
-                    "...mask.nii.gz",
-                    convert_from_minus1_1=False
-                )
-
-                save_nifti(
-                    error_map,
-                    "...error.nii.gz",
-                    convert_from_minus1_1=False
-                )
+                # Error only within the missing region, converted to [0,1].
+                error_map = ((block[i:i+1] - x_recon[i:i+1]).abs() / 2.0) \
+                            * (1.0 - mask[i:i+1])
+                # Unique file names avoid overwriting earlier subjects.
+                prefix = os.path.join(save_dir, f"test_{count:03d}")
+                save_nifti(block[i:i+1], prefix + "_gt.nii.gz", True)
+                save_nifti(x_recon[i:i+1], prefix + "_recon.nii.gz", True)
+                save_nifti(mask[i:i+1], prefix + "_mask.nii.gz", False)
+                save_nifti(error_map, prefix + "_error.nii.gz", False)
 
                 count += 1
 
