@@ -44,13 +44,29 @@ import faulthandler
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from monai.losses import SSIMLoss
 
+import csv
+import re
+
+from scipy.ndimage import gaussian_filter, distance_transform_edt
+
+
 # =============================================
 # Main execution
 # This script trains and evaluates a 3D masked MRI diffusion model.
 # =============================================
 if __name__ == "__main__":  
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    USE_BF16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    # ROCm uses the torch.cuda API. Benchmark AMP using MRI_AMP=auto|bf16|fp16|off.
+    AMP_MODE = os.environ.get("MRI_AMP", "auto").lower()
+    if AMP_MODE not in {"auto", "bf16", "fp16", "off"}:
+        raise ValueError("MRI_AMP must be auto, bf16, fp16, or off")
+    if AMP_MODE == "auto":
+        AMP_MODE = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+    if AMP_MODE == "bf16" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("BF16 not reported as supported; try MRI_AMP=fp16")
+    AMP_ENABLED = AMP_MODE != "off"
+    AMP_DTYPE = torch.bfloat16 if AMP_MODE == "bf16" else torch.float16
+    USE_BF16 = AMP_MODE == "bf16"
     faulthandler.enable()
     print("Device:", device, torch.cuda.get_device_name(0) if device.type == "cuda" else "")
     if device.type == "cpu":
@@ -67,30 +83,106 @@ if __name__ == "__main__":
     # A MRI block is a section which the model will be trained on.
     # It represents a 3D object in which the mask will be located/placed in
 
-    MRI_BLOCK_SHAPE = (32,  #Depth  :  Z
-                    32,  #Hight  :  Y
-                    32)  #Wideth :  X  
+    BLOCK_SIZE = int(os.environ.get("MRI_BLOCK_SIZE", "48"))
+
+    MRI_BLOCK_SHAPE = (
+        BLOCK_SIZE,
+        BLOCK_SIZE,
+        BLOCK_SIZE
+    )
+
+    # Number of sampled patches per MRI per epoch
+    PATCHES_PER_SUBJECT = int(
+        os.environ.get("MRI_PATCHES_PER_SUBJECT", "1")
+    )
+
+    # Minimum distance between mask and patch boundary
+    MIN_MASK_BORDER = int(
+        os.environ.get("MRI_MIN_MASK_BORDER", "4")
+    )
+
+    # Enable interpolation conditioning
+    USE_INTERP_PRIOR = (
+        os.environ.get("MRI_USE_INTERP_PRIOR", "0") == "1"
+    )
+
+    # Independent architectural ablation switches. Both off reproduces
+    # the original SPEED_TUNED model, including its recurrent computation.
+    USE_MASK_GUIDED_SKIP = os.environ.get("MRI_USE_MASK_GUIDED_SKIP", "0") == "1"
+    SKIP_GATE_STRENGTH = float(os.environ.get("MRI_SKIP_GATE_STRENGTH", "0.5"))
+    if not (0.0 < SKIP_GATE_STRENGTH <= 1.0):
+        raise ValueError("MRI_SKIP_GATE_STRENGTH must be in (0, 1]")
+
+    # Optional separate experiment: inject the initial projection at each
+    # recurrent iteration, matching the change made to MANUAL_REVIEWED.
+    USE_RECURRENT_INPUT_INJECTION = (
+        os.environ.get("MRI_RECURRENT_INPUT_INJECTION", "0") == "1"
+    )
+
+    # Keep architectural ablations reproducible when run from scratch.
+    TRAIN_SEED = int(os.environ.get("MRI_SEED", "42"))
+    random.seed(TRAIN_SEED)
+    np.random.seed(TRAIN_SEED)
+    torch.manual_seed(TRAIN_SEED)
+    torch.cuda.manual_seed_all(TRAIN_SEED)
+
+    # Gradient-consistency loss
+    GRADIENT_LOSS_WEIGHT = float(
+        os.environ.get("MRI_GRAD_LOSS_WEIGHT", "0")
+    )
+
+    # High-noise training
+    HIGH_NOISE_FRACTION = float(
+        os.environ.get("MRI_HIGH_NOISE_FRACTION", "0")
+    )
+
+    HIGH_NOISE_START = int(
+        os.environ.get("MRI_HIGH_NOISE_START", "75")
+    )
 
 
     MRI_MASK_MIN = (7,7,7)
     MRI_MASK_MAX = (15,15,15)
 
+    if PATCHES_PER_SUBJECT < 1:
+        raise ValueError("MRI_PATCHES_PER_SUBJECT must be >= 1")
+    if MIN_MASK_BORDER < 0:
+        raise ValueError("MRI_MIN_MASK_BORDER must be >= 0")
+    if any(m + 2 * MIN_MASK_BORDER > b for m, b in zip(MRI_MASK_MAX, MRI_BLOCK_SHAPE)):
+        raise ValueError("MRI mask and twice the requested border must fit inside the patch")
+    if not (0.0 <= HIGH_NOISE_FRACTION <= 1.0):
+        raise ValueError("MRI_HIGH_NOISE_FRACTION must be between 0 and 1")
+    if GRADIENT_LOSS_WEIGHT < 0:
+        raise ValueError("MRI_GRAD_LOSS_WEIGHT must be nonnegative")
+
     base_channel_number=28     
     
     
-    number_of_epochs      = 51 #number of epochs  
+    number_of_epochs = int(
+        os.environ.get("MRI_EPOCHS", "51")
+    ) #number of epochs  
 
 
     
     lr_option         = 4e-5      #learning rate 
 
-    CPU_num_workers = 2 #1          #CPU CORES used 
-    GPU_batch_size=16 #35            #Images stored on gpu
+    CPU_num_workers = int(os.environ.get("MRI_NUM_WORKERS", "4"))
+    if CPU_num_workers < 1:
+        raise ValueError("MRI_NUM_WORKERS must be >= 1 (persistent_workers is enabled)")
+    TRAIN_METRIC_EVERY = int(os.environ.get("MRI_TRAIN_METRIC_EVERY", "25"))
+    if TRAIN_METRIC_EVERY < 1:
+        raise ValueError("MRI_TRAIN_METRIC_EVERY must be at least 1")
+    GPU_batch_size = int(
+        os.environ.get("MRI_BATCH_SIZE", "4")
+    )
 
     
     T = 100                     #Steps
-    DDIM_STEPS = 50
+    DDIM_STEPS = 3
     ETA = 0.0
+
+    EMA_DECAY = 0.999
+
     #Denoising Diffusion Probabilistic Models (DDPMs) 
     #NEED TO TEST T at 50,100,200,500,1000
     #create a^2(t) vs t graph 
@@ -100,6 +192,10 @@ if __name__ == "__main__":
 
 
     PROJECT_DIR = Path(__file__).resolve().parent
+    EXPERIMENT_NAME = os.environ.get("MRI_EXP_NAME", "speed_tuned_mask_guided")
+    RUN_DIR = PROJECT_DIR / "runs" / EXPERIMENT_NAME
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Experiment output directory: {RUN_DIR}")
 
     # Location of Neurite-OASIS dataset
     Training_data_folder = "/home/blayne/Desktop/MRI/Neurite-OASIS"
@@ -113,7 +209,10 @@ if __name__ == "__main__":
             f"MRI dataset folder not found: {Training_data_folder}"
         )
 
-    torch.set_float32_matmul_precision("highest")
+    MATMUL_PRECISION = os.environ.get("MRI_MATMUL_PRECISION", "highest")
+    if MATMUL_PRECISION not in {"highest", "high", "medium"}:
+        raise ValueError("MRI_MATMUL_PRECISION must be highest, high, or medium")
+    torch.set_float32_matmul_precision(MATMUL_PRECISION)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
@@ -123,6 +222,16 @@ if __name__ == "__main__":
     
     
     
+    print(f"Config: patch={MRI_BLOCK_SHAPE}, mask_border={MIN_MASK_BORDER}, "
+          f"repeats={PATCHES_PER_SUBJECT}, prior={USE_INTERP_PRIOR}, "
+          f"gradient_weight={GRADIENT_LOSS_WEIGHT}, batch={GPU_batch_size}")
+    print(f"Speed settings: amp={AMP_MODE}, matmul={MATMUL_PRECISION}, "
+          f"workers={CPU_num_workers}, metric_every={TRAIN_METRIC_EVERY}")
+    print(f"Architectural settings: mask_guided_skip={USE_MASK_GUIDED_SKIP}, "
+          f"gate_strength={SKIP_GATE_STRENGTH}, "
+          f"recurrent_input_injection={USE_RECURRENT_INPUT_INJECTION}, "
+          f"seed={TRAIN_SEED}")
+
     # Find MRI scans and divide them into training, validation and test groups.
 
     def MRI_DATA_SET_CONFIG(
@@ -242,41 +351,49 @@ if __name__ == "__main__":
     # Load MRI scans for the model and apply the required preprocessing.
 
     class MRI_Dataset(Dataset):
-        def __init__(self, paths, y, template_path, aligned_dir,
-                        transform=None, return_index=False):
+
+        def __init__(
+            self,
+            paths,
+            y,
+            template_path,
+            aligned_dir,
+            transform=None,
+            return_index=False,
+            repeats=1
+        ):
+
             self.paths = paths
             self.y = y
             self.transform = transform
             self.return_index = return_index
+            self.repeats = repeats
 
             self.template_path = template_path
             self.aligned_dir = aligned_dir
 
         def __len__(self):
-            return len(self.paths)
+
+            return len(self.paths) * self.repeats
 
         def __getitem__(self, idx):
-            path = self.paths[idx]
-            label = self.y[idx]
 
-            # ------------------------------
-            # Load data
-            #-----------------------------
+            subject_idx = idx % len(self.paths)
+
+            path = self.paths[subject_idx]
+            label = self.y[subject_idx]
+
             nii = nib.load(path)
+
             data = nii.get_fdata(dtype=np.float32)
 
-            # -----------------------------
-            # Normalize
-            # -----------------------------
-            data = (data - data.min()) / (data.max() - data.min() + 1e-8)
+            data = (
+                (data - data.min())
+                / (data.max() - data.min() + 1e-8)
+            )
 
-            # -----------------------------
-            # Tensor + reorder
-            # -----------------------------
             image = torch.from_numpy(data)
-            # NIfTI array is [X,Y,Z]; model uses [D,H,W] = [Z,Y,X].
-            # NOTE: This corrects the previous [Z,X,Y] ordering and changes
-            # axis conventions relative to any old checkpoints.
+
             image = image.permute(2, 1, 0).contiguous()
 
             if self.transform is not None:
@@ -324,7 +441,9 @@ if __name__ == "__main__":
         template_path=TEMPLATE_PATH,
         aligned_dir=ALIGNED_DIR,
         transform=base_transform,
-        return_index=True
+        return_index=True,
+        repeats=PATCHES_PER_SUBJECT
+
     )
 
 
@@ -353,7 +472,7 @@ if __name__ == "__main__":
             shuffle=True,
             drop_last=True,
             num_workers=CPU_num_workers,
-            pin_memory=False,
+            pin_memory=True,
             persistent_workers=True,
             prefetch_factor=2
         )
@@ -364,7 +483,7 @@ if __name__ == "__main__":
         shuffle=False,
         #drop_last=True,
         num_workers=CPU_num_workers,
-        pin_memory=False,
+        pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2
     )
@@ -418,9 +537,10 @@ if __name__ == "__main__":
 
     def Masking_function(
         MRI_Model,
-        MRI_MASK_SHAPE=(31,31,31),
-        MRI_BLOCK_SHAPE=(64,64,64),
-        device=None
+        MRI_MASK_SHAPE=(31, 31, 31),
+        MRI_BLOCK_SHAPE=(64, 64, 64),
+        device=None,
+        min_border=MIN_MASK_BORDER
     ):
         device = device if device is not None else MRI_Model.device
 
@@ -434,6 +554,18 @@ if __name__ == "__main__":
 
         bd, bh, bw = MRI_BLOCK_SHAPE
         MD, MH, MW = MRI_MASK_SHAPE
+
+        for patch_dim, mask_dim in zip(
+            MRI_BLOCK_SHAPE,
+            MRI_MASK_SHAPE
+        ):
+            if mask_dim + 2 * min_border > patch_dim:
+                raise ValueError(
+                    f"Mask {MRI_MASK_SHAPE} with border {min_border} "
+                    f"cannot fit inside patch {MRI_BLOCK_SHAPE}"
+                )
+
+            
         if any(s > v for s, v in zip((bd, bh, bw), (D, H, W))):
             raise ValueError(f"MRI block {MRI_BLOCK_SHAPE} exceeds volume {(D, H, W)}")
         if any(m > b for m, b in zip((MD, MH, MW), (bd, bh, bw))):
@@ -533,17 +665,25 @@ if __name__ == "__main__":
 
             cmz, cmy, cmx = idxm.tolist()
 
-            cmz = max(MD//2, min(cmz, bd - (MD - MD//2)))
-            cmy = max(MH//2, min(cmy, bh - (MH - MH//2)))
-            cmx = max(MW//2, min(cmx, bw - (MW - MW//2)))
+            z1 = max(
+                min_border,
+                min(cmz - MD // 2, bd - MD - min_border)
+            )
 
-            mask = torch.ones_like(block)
+            y1 = max(
+                min_border,
+                min(cmy - MH // 2, bh - MH - min_border)
+            )
 
-            z1 = cmz - MD//2
-            y1 = cmy - MH//2
-            x1 = cmx - MW//2
+            x1 = max(
+                min_border,
+                min(cmx - MW // 2, bw - MW - min_border)
+            )
 
-            
+            cmz = z1 + MD // 2
+            cmy = y1 + MH // 2
+            cmx = x1 + MW // 2
+
             mask = torch.ones_like(block)
 
             mask[
@@ -576,7 +716,107 @@ if __name__ == "__main__":
         )
         
     # Create the cosine noise schedule used during diffusion.
+    def make_interpolation_prior(block_cpu, mask_cpu, sigma=2.0):
 
+        block_np = block_cpu.numpy()
+        mask_np = mask_cpu.numpy()
+
+        out = np.empty_like(
+            block_np,
+            dtype=np.float32
+        )
+
+        for i in range(block_np.shape[0]):
+
+            observed = (
+                mask_np[i, 0] > 0.5
+            ).astype(np.float32)
+
+            observed_value = (
+                block_np[i, 0] * observed
+            )
+
+            numerator = gaussian_filter(
+                observed_value,
+                sigma=sigma
+            )
+
+            denominator = gaussian_filter(
+                observed,
+                sigma=sigma
+            )
+
+            nearest_idx = distance_transform_edt(
+                observed < 0.5,
+                return_distances=False,
+                return_indices=True
+            )
+
+            nearest_value = block_np[i, 0][
+                tuple(nearest_idx)
+            ]
+
+            interpolated = np.where(
+                denominator > 1e-4,
+                numerator / np.maximum(denominator, 1e-4),
+                nearest_value
+            ).clip(-1.0, 1.0)
+
+            out[i, 0] = (
+                observed_value
+                + (1.0 - observed) * interpolated
+            )
+
+        return torch.from_numpy(out)
+
+    def masked_gradient_loss_per_sample(
+        pred_x0,
+        ground_truth,
+        known_mask
+    ):
+
+        missing = 1.0 - known_mask
+
+        completed = (
+            pred_x0 * missing
+            + ground_truth * known_mask
+        )
+
+        loss_parts = []
+
+        for axis in (-3, -2, -1):
+
+            n = completed.shape[axis]
+
+            a = completed.narrow(axis, 1, n - 1)
+            b = completed.narrow(axis, 0, n - 1)
+
+            ta = ground_truth.narrow(axis, 1, n - 1)
+            tb = ground_truth.narrow(axis, 0, n - 1)
+
+            ma = missing.narrow(axis, 1, n - 1)
+            mb = missing.narrow(axis, 0, n - 1)
+
+            include_pair = (
+                ma + mb
+            ).clamp(max=1.0)
+
+            error = (
+                ((a - b) - (ta - tb)).abs()
+                * include_pair
+            )
+
+            loss_parts.append(
+                error.flatten(1).sum(dim=1)
+                / include_pair.flatten(1)
+                .sum(dim=1)
+                .clamp_min(1.0)
+            )
+
+        return torch.stack(
+            loss_parts,
+            dim=1
+        ).mean(dim=1)
     def cosine_beta_schedule(timesteps, s=0.008):
         """
         Cosine diffusion schedule.
@@ -807,10 +1047,15 @@ if __name__ == "__main__":
 
         def forward(self, x):
 
-            h = self.conv(x)
+            initial = self.conv(x)
+            h = initial
 
             for _ in range(self.t):
-                h = h + self.recurrent(h)
+                if USE_RECURRENT_INPUT_INJECTION:
+                    h = initial + self.recurrent(h)
+                else:
+                    # Preserve the SPEED_TUNED recurrence for attention-only tests.
+                    h = h + self.recurrent(h)
 
             return h
 
@@ -897,6 +1142,52 @@ if __name__ == "__main__":
                 residual = x
 
             return x
+
+    class MaskGuidedSkipGate3D(nn.Module):
+        """Decoder- and mask-conditioned spatial gate for a dense 3D skip.
+
+        known_mask: 1 for observed anatomy, 0 for missing voxels.
+        The gate learns from both known and missing regions; it does not
+        hard-mask encoder features. The zero-initialised output projection
+        makes this operation exactly the identity at initialisation.
+        """
+        def __init__(self, skip_channels, decoder_channels, reduction=4, strength=0.5):
+            super().__init__()
+            hidden = max(8, min(skip_channels, decoder_channels) // reduction)
+            self.skip_projection = nn.Conv3d(skip_channels, hidden, kernel_size=1, bias=False)
+            self.decoder_projection = nn.Conv3d(decoder_channels, hidden, kernel_size=1, bias=False)
+            self.mask_projection = nn.Conv3d(1, hidden, kernel_size=1, bias=False)
+            self.psi = nn.Conv3d(hidden, 1, kernel_size=1)
+            self.strength = float(strength)
+            nn.init.zeros_(self.psi.weight)
+            nn.init.zeros_(self.psi.bias)
+
+        def forward(self, skip, decoder, known_mask):
+            if skip.shape[-3:] != decoder.shape[-3:]:
+                raise ValueError("Skip and decoder spatial dimensions must match")
+            if known_mask is None:
+                raise ValueError("Mask-guided attention requires the known-region mask")
+            if known_mask.ndim == 4:
+                known_mask = known_mask.unsqueeze(1)
+            if known_mask.ndim != 5 or known_mask.shape[1] != 1:
+                raise ValueError("known_mask must have shape [B,1,D,H,W]")
+
+            missing = (1.0 - known_mask).to(device=skip.device, dtype=skip.dtype)
+            missing = F.interpolate(
+                missing,
+                size=skip.shape[-3:],
+                mode="trilinear",
+                align_corners=False,
+            )
+            features = (
+                self.skip_projection(skip)
+                + self.decoder_projection(decoder)
+                + self.mask_projection(missing)
+            )
+            logits = self.psi(F.silu(features))
+            # Multiplier is initially 1 and stays in [1-strength, 1+strength].
+            attention = 1.0 + self.strength * torch.tanh(logits)
+            return skip * attention
     # -------------------------------------------------
     # Attention Block
     # -------------------------------------------------
@@ -1011,10 +1302,19 @@ if __name__ == "__main__":
     # Define the 3D recurrent residual U-Net used to predict the diffusion noise.
 
     class DiffusionR2UPlusPlus(nn.Module):
-        def __init__(self, image_channels=1, mask_channels=1, base=base_channel_number):
+        def __init__(self, image_channels=1, mask_channels=1, base=base_channel_number,
+                     use_interp_prior=USE_INTERP_PRIOR,
+                     use_mask_guided_skip=USE_MASK_GUIDED_SKIP,
+                     skip_gate_strength=SKIP_GATE_STRENGTH):
             super().__init__()
 
-            in_ch = image_channels * 2 + mask_channels
+            self.use_interp_prior = use_interp_prior
+            self.use_mask_guided_skip = use_mask_guided_skip
+
+            in_ch = (
+                image_channels * (2 + int(use_interp_prior))
+                + mask_channels
+            )
             time_dim = base * 4
 
             # Time embedding (unchanged)
@@ -1047,7 +1347,15 @@ if __name__ == "__main__":
             # Dense Skip Connections
             self.skip1 = DenseSkipConnection(base*2)
             self.skip2 = DenseSkipConnection(base*4)
-            
+            if self.use_mask_guided_skip:
+                self.gate_skip2 = MaskGuidedSkipGate3D(
+                    skip_channels=base*4, decoder_channels=base*8,
+                    strength=skip_gate_strength,
+                )
+                self.gate_skip1 = MaskGuidedSkipGate3D(
+                    skip_channels=base*2, decoder_channels=base*4,
+                    strength=skip_gate_strength,
+                )
 
             # Upsampling layers
             self.up_sample1 = UpSample3D(base*8, base*8)
@@ -1063,36 +1371,30 @@ if __name__ == "__main__":
             # Final convolution
             self.final = nn.Conv3d(base, image_channels, 1)
 
-        def forward(self, x, t, *, coords=None, mask=None, mask_info=None,context=None):
-            if mask is None:
-                mask = torch.ones_like(x)
+        def forward(self, x, t, *, coords=None, mask=None, mask_info=None,context=None,interpolation_prior=None):
+            # Save original observed/missing mask for gates before x becomes features.
+            known_mask = mask
+            channels = [
+                x,
+                context,
+                mask
+            ]
 
-            elif mask.dim() == 4:
-                mask = mask.unsqueeze(1)
+            if self.use_interp_prior:
 
-            mask = mask.to(
-                device=x.device,
-                dtype=x.dtype
-            )
+                if interpolation_prior is None:
+                    raise ValueError(
+                        "Interpolation prior is required"
+                    )
 
-            # Explicit clean MRI context
-            if context is None:
-                context = x * mask
+                channels.append(
+                    interpolation_prior.to(
+                        device=x.device,
+                        dtype=x.dtype
+                    )
+                )
 
-            context = context.to(
-                device=x.device,
-                dtype=x.dtype
-            )
-
-            # x_t + clean context + binary mask
-            x = torch.cat(
-                [
-                    x,
-                    context,
-                    mask
-                ],
-                dim=1
-            )
+            x = torch.cat(channels, dim=1)
 
             t_emb = self.time_mlp(t)
             
@@ -1127,6 +1429,8 @@ if __name__ == "__main__":
             
             x = self.up_sample1(x_mid)
             x = crop_to_match(x, skip2)  # Crop to match skip2 (x3)
+            if self.use_mask_guided_skip:
+                skip2 = self.gate_skip2(skip2, x, known_mask)
             x = torch.cat([x, skip2], dim=1)
             x = self.up1(x, t_emb)
             x = self.up1_attn(x)
@@ -1134,6 +1438,8 @@ if __name__ == "__main__":
 
             x = self.up_sample2(x)
             x = crop_to_match(x, skip1)  # Crop to match skip1 (x2)
+            if self.use_mask_guided_skip:
+                skip1 = self.gate_skip1(skip1, x, known_mask)
             x = torch.cat([x, skip1], dim=1)
             x = self.up2(x, t_emb)
             
@@ -1163,6 +1469,33 @@ if __name__ == "__main__":
         "Num params:",
         sum(p.numel() for p in raw_model.parameters())
     )
+
+    # Optional initialisation from a baseline checkpoint. This loads *weights*
+    # only; the optimiser and epoch number deliberately start fresh for a
+    # paired attention-only fine-tuning experiment.
+    init_checkpoint_path = os.environ.get("MRI_INIT_CHECKPOINT", "").strip()
+    if init_checkpoint_path:
+        weight_source = os.environ.get("MRI_INIT_WEIGHT_SOURCE", "ema").lower()
+        if weight_source not in {"ema", "model"}:
+            raise ValueError("MRI_INIT_WEIGHT_SOURCE must be 'ema' or 'model'")
+        saved = torch.load(init_checkpoint_path, map_location="cpu", weights_only=True)
+        if isinstance(saved, dict) and ("ema" in saved or "model" in saved):
+            if weight_source not in saved:
+                raise KeyError(f"Checkpoint has no {weight_source!r} weights")
+            saved = saved[weight_source]
+        result = raw_model.load_state_dict(saved, strict=False)
+        allowed_missing = (
+            lambda k: k.startswith("gate_skip1.") or k.startswith("gate_skip2.")
+        ) if USE_MASK_GUIDED_SKIP else (lambda k: False)
+        invalid_missing = [k for k in result.missing_keys if not allowed_missing(k)]
+        if invalid_missing or result.unexpected_keys:
+            raise RuntimeError(
+                f"Incompatible checkpoint: missing={invalid_missing[:8]}, "
+                f"unexpected={result.unexpected_keys[:8]}"
+            )
+        print(f"Initialised model weights from {init_checkpoint_path} "
+              f"(source={weight_source}, new gate tensors={len(result.missing_keys)}). "
+              "Optimiser starts fresh.")
     #print(model)
 
 
@@ -1234,7 +1567,7 @@ if __name__ == "__main__":
     
     # Calculate the training loss for the predicted diffusion output.
 
-    def get_loss(model,MRI_Model, block,mask,block_location,mask_location,MRI_BLOCK_SHAPE,current_mask_shape, t):
+    def get_loss(model,MRI_Model, block,mask,block_location,mask_location,MRI_BLOCK_SHAPE,current_mask_shape, t, interpolation_prior=None):
         # MRI_Model is the full volume, intentionally kept on CPU to save VRAM.
         # block and mask are small 3D patches transferred to the GPU.
         block = block.to(device)
@@ -1275,7 +1608,8 @@ if __name__ == "__main__":
         context = block * mask_5d
         v_pred = model(
             x_noisy, t, coords=coords, mask=mask_5d,
-            mask_info=mask_info, context=context
+            mask_info=mask_info, context=context,
+            interpolation_prior=interpolation_prior
         )
 
         # Recover x0 from predicted velocity, consistent with sample_timestep().
@@ -1386,6 +1720,19 @@ if __name__ == "__main__":
             + 0.1 * l1_loss_per_sample
         )
 
+        if GRADIENT_LOSS_WEIGHT > 0:
+
+            gradient_per_sample = masked_gradient_loss_per_sample(
+                x0_pred,
+                block,
+                mask_5d
+            )
+
+            loss_per_sample = (
+                loss_per_sample
+                + GRADIENT_LOSS_WEIGHT * gradient_per_sample
+            )
+
         loss = loss_per_sample.mean()     
         if not torch.isfinite(loss):
             raise RuntimeError(
@@ -1395,7 +1742,36 @@ if __name__ == "__main__":
         return loss, x_noisy, v_pred, noise
     
     # Run one reverse diffusion step during reconstruction.
+    def select_train_timesteps(batch_size):
 
+        times = torch.randint(
+            0,
+            T,
+            (batch_size,),
+            device=device
+        )
+
+        if HIGH_NOISE_FRACTION > 0:
+
+            select = (
+                torch.rand(batch_size, device=device)
+                < HIGH_NOISE_FRACTION
+            )
+
+            high_t = torch.randint(
+                HIGH_NOISE_START,
+                T,
+                (batch_size,),
+                device=device
+            )
+
+            times = torch.where(
+                select,
+                high_t,
+                times
+            )
+
+        return times
     @torch.no_grad()
     def sample_timestep(
         model,
@@ -1408,7 +1784,8 @@ if __name__ == "__main__":
         current_mask_shape,
         t,
         t_prev,
-        eta=ETA
+        eta=ETA,
+        interpolation_prior=None
     ):
 
         D, H, W = MRI_Model.shape[-3:]
@@ -1461,14 +1838,16 @@ if __name__ == "__main__":
             mask_5d = mask
 
         context = original_block * mask_5d
-        v_pred = model(
-            x,
-            t,
-            coords=coords,
-            mask=mask_5d,
-            mask_info=mask_info,
-            context=context
-        )
+        with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=AMP_ENABLED):
+            v_pred = model(
+                x,
+                t,
+                coords=coords,
+                mask=mask_5d,
+                mask_info=mask_info,
+                context=context,
+                interpolation_prior=interpolation_prior
+            )
 
         # x0 reconstruction
         x0_pred = (
@@ -1489,17 +1868,15 @@ if __name__ == "__main__":
             * torch.sqrt(1 - alpha_t/alpha_prev)
         )
 
-        noise = torch.randn_like(x)
+        noise = torch.randn_like(x) if eta != 0.0 else None
 
         pred_dir = torch.sqrt(
             1 - alpha_prev - sigma_t**2
         ) * eps_pred
 
-        x_prev = (
-            torch.sqrt(alpha_prev) * x0_pred
-            + pred_dir
-            + sigma_t * noise
-        )
+        x_prev = torch.sqrt(alpha_prev) * x0_pred + pred_dir
+        if noise is not None:
+            x_prev = x_prev + sigma_t * noise
 
         # preserve known region
         x_prev = (
@@ -1509,7 +1886,21 @@ if __name__ == "__main__":
 
         return x_prev
     
-    
+    def get_ddim_schedule(steps):
+
+        if steps == 3:
+            return [T - 1, 14, 0]
+
+        return (
+            torch.linspace(
+                T - 1,
+                0,
+                steps=min(steps, T)
+            )
+            .round()
+            .long()
+            .tolist()
+        )
     # Set up the starting noise for the missing MRI region.
 
     def initialise_inpainting_noise(block, mask):
@@ -1650,6 +2041,10 @@ if __name__ == "__main__":
             dtype=block.dtype
         )
 
+        plot_prior = (
+            make_interpolation_prior(block.float().cpu(), mask.float().cpu()).to(device)
+            if USE_INTERP_PRIOR else None
+        )
         x_noisy = initialise_inpainting_noise(
             block,
             mask
@@ -1660,12 +2055,9 @@ if __name__ == "__main__":
         # -----------------------------
         ddim_steps = min(ddim_steps, T_local)
 
-        step_indices = torch.linspace(
-            T_local - 1,
-            0,
-            steps=ddim_steps,
-            device=device
-        ).round().long()
+        step_indices = torch.tensor(
+            get_ddim_schedule(ddim_steps), device=device, dtype=torch.long
+        )
 
         step_indices = torch.unique_consecutive(
             step_indices
@@ -1736,7 +2128,8 @@ if __name__ == "__main__":
                 current_mask_shape,
                 t,
                 t_prev,
-                eta=ETA
+                eta=ETA,
+                interpolation_prior=plot_prior
             )
 
             i_int = current_t
@@ -1805,107 +2198,37 @@ if __name__ == "__main__":
     # Measure PSNR over the region that was hidden from the model.
 
     def compute_psnr_masked(original, reconstructed, mask):
-        """
-        Compute PSNR ONLY on the reconstructed (masked) region
-        """
-
-        # ------------------------------------------
-        # Convert from [-1,1] -> [0,1]
-        # ------------------------------------------
-        original      = (original + 1) / 2.0
-        reconstructed = (reconstructed + 1) / 2.0
-
-        # ------------------------------------------
-        # Evaluate ONLY masked voxels
-        # mask:
-        #   1 = known region
-        #   0 = reconstructed region
-        # ------------------------------------------
-        masked_region = (1 - mask)
-
-        # Safety
-        num_masked_voxels = masked_region.sum()
-
-        if num_masked_voxels == 0:
-            return 0.0
-
-        # ------------------------------------------
-        # MSE only inside reconstructed region
-        # ------------------------------------------
-        mse = (
-            ((original - reconstructed) ** 2) * masked_region
-        ).sum() / num_masked_voxels
-
-        mse = torch.clamp(mse, min=1e-10)
-
-        psnr = 10 * torch.log10(1.0 / mse)
-
-        return psnr.item()
-
-    # Measure SSIM over the region that was hidden from the model.
+        """Average masked-region PSNR per subject, in decibels."""
+        true = (original.float() + 1.0) / 2.0
+        pred = (reconstructed.float() + 1.0) / 2.0
+        missing = 1.0 - mask.float()
+        b = true.shape[0]
+        mse = (((true - pred).square() * missing).reshape(b, -1).sum(dim=1) /
+               missing.reshape(b, -1).sum(dim=1).clamp_min(1))
+        return (10 * torch.log10(1.0 / mse.clamp_min(1e-10))).mean().item()
 
     def compute_ssim_masked(original, reconstructed, mask):
-        """
-        Compute 3D SSIM over the bounding box of the reconstructed region.
+        """Average 3D SSIM of each subject's own missing cuboid."""
+        true = (original.float() + 1.0) / 2.0
+        pred = (reconstructed.float() + 1.0) / 2.0
+        if mask.dim() == 4:
+            mask = mask.unsqueeze(1)
+        missing = (1.0 - mask.float()) > 0.5
+        values = []
+        for i in range(true.shape[0]):
+            xyz = missing[i, 0].nonzero(as_tuple=False)
+            if xyz.numel() == 0:
+                continue
+            z0, y0, x0 = xyz.min(dim=0).values.tolist()
+            z1, y1, x1 = (xyz.max(dim=0).values + 1).tolist()
+            if min(z1 - z0, y1 - y0, x1 - x0) < 5:
+                raise ValueError(f"SSIM window too large for mask crop {z1-z0,y1-y0,x1-x0}")
+            values.append((1 - ssim_3d(
+                pred[i:i+1, :, z0:z1, y0:y1, x0:x1],
+                true[i:i+1, :, z0:z1, y0:y1, x0:x1]
+            )).item())
+        return sum(values) / len(values) if values else float('nan')
 
-        mask = 1 -> known/context
-        mask = 0 -> reconstructed region
-        """
-
-        # [-1, 1] -> [0, 1]
-        original = (original + 1) / 2.0
-        reconstructed = (reconstructed + 1) / 2.0
-
-        masked_region = (1 - mask)
-
-        if masked_region.sum() == 0:
-            return 0.0
-
-        # Find coordinates occupied by the missing region.
-        # Collapse batch/channel dimensions first.
-        spatial_mask = masked_region.any(dim=0)
-
-        if spatial_mask.dim() == 4:
-            spatial_mask = spatial_mask.any(dim=0)
-
-        coords = torch.nonzero(spatial_mask, as_tuple=False)
-
-        z_min, y_min, x_min = coords.min(dim=0).values
-        z_max, y_max, x_max = coords.max(dim=0).values
-
-        # Convert to Python integers
-        z_min = int(z_min.item())
-        y_min = int(y_min.item())
-        x_min = int(x_min.item())
-
-        z_max = int(z_max.item()) + 1
-        y_max = int(y_max.item()) + 1
-        x_max = int(x_max.item()) + 1
-
-        original_crop = original[
-            :, :, z_min:z_max, y_min:y_max, x_min:x_max
-        ]
-
-        reconstructed_crop = reconstructed[
-            :, :, z_min:z_max, y_min:y_max, x_min:x_max
-        ]
-
-        if min(original_crop.shape[-3:]) < 5:
-            raise ValueError(
-                f"Masked region too small for 3D SSIM: "
-                f"{original_crop.shape[-3:]}"
-            )
-
-        loss = ssim_3d(
-            reconstructed_crop,
-            original_crop
-        )
-
-        ssim_value = 1.0 - loss
-
-        return ssim_value.item()
-        
-        
     ema = EMA(raw_model, decay=0.999)
     
     
@@ -1928,7 +2251,8 @@ if __name__ == "__main__":
     val_ssim_list = []
     
     
-    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    # FP16 needs loss scaling; BF16 generally does not. Disabled scaler is a no-op.
+    scaler = torch.amp.GradScaler("cuda", enabled=(AMP_MODE == "fp16"))
     
     for epoch in range(number_of_epochs):
         # ---- TRAIN ----
@@ -1940,7 +2264,8 @@ if __name__ == "__main__":
         val_metric_count = 0
         train_loss_sum = torch.zeros((), device=device)
         train_batches_processed = 0
-        TRAIN_METRIC_EVERY = 10
+        torch.cuda.synchronize()  # done once per epoch, for a comparable epoch timer
+        train_epoch_start = time.perf_counter()
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=True)
         
@@ -1954,9 +2279,9 @@ if __name__ == "__main__":
 
             B = MRI_model.shape[0]
 
-            t = torch.randint(0, T, (B,), device=device)
+            t = select_train_timesteps(B)
             
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_BF16):
+            with torch.amp.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=AMP_ENABLED):
                 current_mask_shape = random_mask_shape(
                     MRI_MASK_MIN,
                     MRI_MASK_MAX
@@ -1970,6 +2295,11 @@ if __name__ == "__main__":
                     )
 
                 
+                # Observed-only interpolation prior, computed while patches are on CPU.
+                interpolation_prior = (
+                    make_interpolation_prior(block, mask).to(device, non_blocking=True)
+                    if USE_INTERP_PRIOR else None
+                )
                 block = block.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
                 if batch_idx % TRAIN_METRIC_EVERY == 0:
@@ -1984,7 +2314,11 @@ if __name__ == "__main__":
                         "GiB"
                     )
 
-                loss, x_noisy, v_pred, noise  = get_loss(model, MRI_model,block,mask,block_location,mask_block_location,MRI_BLOCK_SHAPE,current_mask_shape,t)
+                loss, x_noisy, v_pred, noise = get_loss(
+                    model, MRI_model, block, mask, block_location,
+                    mask_block_location, MRI_BLOCK_SHAPE, current_mask_shape, t,
+                    interpolation_prior=interpolation_prior
+                )
             
                 if loss is None:
                     continue
@@ -2025,9 +2359,9 @@ if __name__ == "__main__":
                         (x0_pred),
                         (mask)
                     )
-                train_psnr_epoch += psnr
-                train_ssim_epoch += ssim
-                train_metric_count += 1
+                train_psnr_epoch += psnr * B
+                train_ssim_epoch += ssim * B
+                train_metric_count += B
 
                 if False and (epoch + 1) % 5 == 0:
                     sample_plot_image(
@@ -2060,6 +2394,12 @@ if __name__ == "__main__":
         train_loss_epoch = (
             train_loss_sum / max(train_batches_processed, 1)
         ).item()
+        torch.cuda.synchronize()
+        train_seconds = time.perf_counter() - train_epoch_start
+        train_examples = train_batches_processed * GPU_batch_size
+        print(f"Training epoch {epoch}: {train_seconds:.1f} s, "
+              f"{train_examples / max(train_seconds, 1e-6):.2f} patches/s "
+              f"({train_examples} patches)")
         train_losses.append(train_loss_epoch)
         pbar.set_postfix({
             "loss": f"{train_loss_epoch:.4f}",
@@ -2071,6 +2411,8 @@ if __name__ == "__main__":
         # ---- VALIDATION ----
         ema.ema_model.eval()
         val_loss_epoch = 0
+        val_loss_sum = torch.zeros((), device=device)
+        val_samples_processed = 0
         val_psnr_epoch = 0
         val_ssim_epoch = 0
         
@@ -2084,7 +2426,7 @@ if __name__ == "__main__":
                 B = MRI_model.shape[0]
                 t = torch.randint(0, T, (B,), device=device)
             
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=USE_BF16):
+                with torch.amp.autocast(device_type="cuda", dtype=AMP_DTYPE, enabled=AMP_ENABLED):
 
                     current_mask_shape = random_mask_shape(
                         MRI_MASK_MIN,
@@ -2097,11 +2439,16 @@ if __name__ == "__main__":
                             current_mask_shape,
                             MRI_BLOCK_SHAPE
                         )
+                    interpolation_prior = (
+                        make_interpolation_prior(block, mask).to(device, non_blocking=True)
+                        if USE_INTERP_PRIOR else None
+                    )
                     block = block.to(device, non_blocking=True)
                     mask = mask.to(device, non_blocking=True)
                     loss, x_noisy, v_pred, noise = get_loss(
                         ema.ema_model, MRI_model, block, mask, block_location,
-                        mask_block_location, MRI_BLOCK_SHAPE, current_mask_shape, t
+                        mask_block_location, MRI_BLOCK_SHAPE, current_mask_shape, t,
+                        interpolation_prior=interpolation_prior
                     )
 
                 if loss is None:
@@ -2140,9 +2487,8 @@ if __name__ == "__main__":
                 val_metric_count += B
                 
                         
-                val_loss_epoch += loss.item()
-                val_pbar.set_postfix({
-                "val_loss": f"{loss.item():.4f}"})
+                val_loss_sum += loss.detach() * B
+                val_samples_processed += B
             if val_metric_count > 0:
                 val_psnr_epoch /= val_metric_count
                 val_ssim_epoch /= val_metric_count
@@ -2150,7 +2496,7 @@ if __name__ == "__main__":
                 val_ssim_list.append(val_ssim_epoch)
 
 
-            val_loss_epoch /= len(val_loader)
+            val_loss_epoch = (val_loss_sum / max(val_samples_processed, 1)).item()
             val_losses.append(val_loss_epoch)
 
 
@@ -2169,6 +2515,10 @@ if __name__ == "__main__":
         scheduler.step()
         checkpoint = {
             "epoch": epoch,
+            "mask_guided_skip": USE_MASK_GUIDED_SKIP,
+            "skip_gate_strength": SKIP_GATE_STRENGTH,
+            "recurrent_input_injection": USE_RECURRENT_INPUT_INJECTION,
+            "amp_mode": AMP_MODE,
             "model": raw_model.state_dict(),
             "ema": ema.ema_model.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -2181,8 +2531,10 @@ if __name__ == "__main__":
             "val_ssim": val_ssim_list
         }
 
-        torch.save(checkpoint, "mri_last.tmp")
-        os.replace("mri_last.tmp", "mri_last.pt")
+        tmp_ckpt = RUN_DIR / "mri_last.tmp"
+        last_ckpt = RUN_DIR / "mri_last.pt"
+        torch.save(checkpoint, tmp_ckpt)
+        os.replace(tmp_ckpt, last_ckpt)
 
         print(f"Checkpoint saved: Epoch {epoch}")
 
@@ -2193,7 +2545,7 @@ if __name__ == "__main__":
     plt.ylabel("Loss")
     plt.legend()
     plt.title("Training vs Validation Loss")
-    plt.savefig("V2_GREY_loss_curve.png", dpi=300)
+    plt.savefig(RUN_DIR / "loss_curve.png", dpi=300)
     plt.close()
     
     print("Saved loss curve to V2_GREY_loss_curve.png")
@@ -2205,7 +2557,7 @@ if __name__ == "__main__":
     plt.ylabel("PSNR")
     plt.legend()
     plt.title("PSNR")
-    plt.savefig("PSNR_curve.png", dpi=300)
+    plt.savefig(RUN_DIR / "PSNR_curve.png", dpi=300)
     plt.close()
 
     plt.figure()
@@ -2215,13 +2567,13 @@ if __name__ == "__main__":
     plt.ylabel("SSIM")
     plt.legend()
     plt.title("SSIM")
-    plt.savefig("SSIM_curve.png", dpi=300)
+    plt.savefig(RUN_DIR / "SSIM_curve.png", dpi=300)
     plt.close()
     
     
     
-    torch.save(raw_model.state_dict(), "MB_GREY_SIG_V2_raw_final.pt")
-    torch.save(ema.ema_model.state_dict(), "MB_GREY_SIG_V2_EMA_final.pt")
+    torch.save(raw_model.state_dict(), RUN_DIR / "raw_final.pt")
+    torch.save(ema.ema_model.state_dict(), RUN_DIR / "ema_final.pt")
 
 
 
@@ -2268,6 +2620,12 @@ if __name__ == "__main__":
             dtype=block.dtype
         )
 
+        # One interpolation prior for the entire DDIM trajectory.
+        inference_prior = (
+            make_interpolation_prior(block.float().cpu(), mask.float().cpu()).to(device)
+            if USE_INTERP_PRIOR else None
+        )
+
         # ------------------------------------------
         # Start missing region from PURE NOISE
         # ------------------------------------------
@@ -2281,12 +2639,18 @@ if __name__ == "__main__":
         # ------------------------------------------
         ddim_steps = min(ddim_steps, T)
 
-        step_indices = torch.linspace(
-            T - 1,
-            0,
-            steps=ddim_steps,
-            device=device
-        ).round().long()
+        if ddim_steps == 3:
+            step_indices = torch.tensor(
+                [99, 14, 0],
+                device=device,
+                dtype=torch.long
+            )
+        else:
+            step_indices = torch.tensor(
+                get_ddim_schedule(ddim_steps),
+                device=device,
+                dtype=torch.long
+            )
 
         # Remove possible duplicates caused by rounding
         step_indices = torch.unique_consecutive(
@@ -2334,7 +2698,8 @@ if __name__ == "__main__":
                 current_mask_shape=current_mask_shape,
                 t=t,
                 t_prev=t_prev,
-                eta=ETA
+                eta=ETA,
+                interpolation_prior=inference_prior
             )
 
         # ------------------------------------------
@@ -2394,7 +2759,7 @@ if __name__ == "__main__":
     val_ssim_list = []
     
     
-    save_dir = "recon_outputs"
+    save_dir = str(RUN_DIR / "recon_outputs")
     os.makedirs(save_dir, exist_ok=True)
     
     with torch.no_grad():
@@ -2555,7 +2920,7 @@ if __name__ == "__main__":
     plt.grid(True)
 
     plt.savefig(
-        "PSNR_model_testing_data.png",
+        RUN_DIR / "PSNR_model_testing_data.png",
         dpi=300,
         bbox_inches="tight"
     )
@@ -2582,7 +2947,7 @@ if __name__ == "__main__":
     plt.grid(True)
 
     plt.savefig(
-        "SSIM_model_testing_data.png",
+        RUN_DIR / "SSIM_model_testing_data.png",
         dpi=300,
         bbox_inches="tight"
     )
